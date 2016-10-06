@@ -18,6 +18,7 @@ package main
 
 import (
   "fmt"
+  "time"
   "io"
   "io/ioutil"
   "log"
@@ -35,7 +36,7 @@ import (
 )
 
 const (
-  version = "1.6.6"
+  version = "1.6.8"
   nginxConf = `
 daemon off;
 
@@ -62,7 +63,7 @@ http {
   log_format proxied_combined '"$http_x_forwarded_for" - $remote_user [$time_local] "$request" '
                       '$status $body_bytes_sent "$http_referer" '
                       '"$http_user_agent" $request_time';
-  
+
   error_log /dev/stderr info;
   access_log /dev/stdout proxied_combined;
 
@@ -78,6 +79,19 @@ http {
       root   /usr/share/nginx/html;
       index index.html index.htm;
     }
+    location /ELBHealthCheck {
+      root /var/www/healthcheck/;
+    }
+    location /nginx_status { # Used by sysdig-agent only. Exclude in Nginx logs.
+      stub_status on;
+      access_log off;
+      allow 127.0.0.1/32;
+      deny all;
+    }
+    location /usr_nginx_status { # Used by user with Nginx log enabled. No access control.
+      stub_status on;
+    }
+
   }
 {{range $i := .}}
 
@@ -173,7 +187,7 @@ func main() {
   } else {
     vaultEnabled = vaultEnabledFlag
   }
- 
+
   if vaultAddress == "" || vaultToken == "" {
     fmt.Printf("\nVault not configured\n")
     vaultEnabled = "false"
@@ -197,24 +211,46 @@ func main() {
 
   // Controller loop
   for {
+
+    freezeConfig := false
+    if vaultEnabled != "true" {
+      freezeConfig = true
+      continue
+    }
+
+    // Check Vault status
+    vaultStatus, err := vault.Sys().SealStatus()
+    if err != nil || vaultStatus == nil {
+      fmt.Printf("Error retrieving Vault status.\n")
+      freezeConfig = true
+      time.Sleep(time.Second * 3)
+      continue
+    }
+
+    if vaultStatus.Sealed == true {
+      fmt.Printf("Vault is sealed.\n")
+      freezeConfig = true
+      time.Sleep(time.Second * 3)
+      continue
+    }
+
     rateLimiter.Accept()
     ingresses, err := ingClient.List(api.ListOptions{})
     if err != nil {
       fmt.Printf("Error retrieving ingresses: %v\n", err)
+      freezeConfig = true
+      time.Sleep(time.Second * 3)
       continue
     }
     if reflect.DeepEqual(ingresses.Items, known.Items) {
       continue
     }
     known = ingresses
-
     type IngressList []*Ingress
-
     var ingresslist IngressList = IngressList{}
 
     for _, ingress := range ingresses.Items {
-
-      ingressHost := ingress.Spec.Rules[0].Host   
+      ingressHost := ingress.Spec.Rules[0].Host
 
       // Setup ingress defaults
 
@@ -250,22 +286,28 @@ func main() {
         }
       }
 
-      if vaultEnabled == "true" && i.Ssl {
-
+      if vaultEnabled == "true" {
         // Renew token
         tokenPath := "/auth/token/renew-self"
         tokenData, err := vault.Logical().Write(tokenPath, nil)
         if err != nil || tokenData == nil {
           fmt.Printf("Error renewing Vault token %v, %v\n", err, tokenData)
+          freezeConfig = true
+          break
         } else {
           fmt.Printf("Successfully renewed Vault token.\n")
         }
+      }
 
+      if i.Ssl {
         vaultPath := "secret/ssl/" + ingressHost
         keySecretData, err := vault.Logical().Read(vaultPath)
-        if err != nil || keySecretData == nil {
-          fmt.Printf("No secret for %v\n", ingressHost)
-          i.Ssl = false
+        if err != nil {
+          fmt.Printf("Error retrieving secret for %v\n", ingressHost)
+          break
+        } else if keySecretData == nil {
+            fmt.Printf("No secret for %v\n", ingressHost)
+            i.Ssl = false
         } else {
           fmt.Printf("Found secret for %v\n", ingressHost)
           var keySecret string = fmt.Sprintf("%v", keySecretData.Data["key"])
@@ -300,16 +342,17 @@ func main() {
       ingresslist = append(ingresslist, i)
 
     }
+    if freezeConfig != true {
+      if w, err := os.Create(nginxConfDir + "/nginx.conf"); err != nil {
+        log.Fatalf("failed to open %v: %v\n", nginxTemplate, err)
+      } else if err := tmpl.Execute(w, ingresslist); err != nil {
+          log.Fatalf("failed to write template %v\n", err)
+      }
 
-    if w, err := os.Create(nginxConfDir + "/nginx.conf"); err != nil {
-      log.Fatalf("failed to open %v: %v\n", nginxTemplate, err)
-    } else if err := tmpl.Execute(w, ingresslist); err != nil {
-      log.Fatalf("failed to write template %v\n", err)
-    }
-
-    if debug  == "true" {
-      conf, _ := ioutil.ReadFile(nginxConfDir + "/nginx.conf")
-      fmt.Printf(string(conf))
+      if debug  == "true" {
+        conf, _ := ioutil.ReadFile(nginxConfDir + "/nginx.conf")
+        fmt.Printf(string(conf))
+      }
     }
 
     verifyArgs := []string{
@@ -322,12 +365,19 @@ func main() {
       "reload",
     }
 
-    err = exec.Command(nginxCommand, verifyArgs...).Run()
-    if err != nil {
-      fmt.Printf("ERR: nginx config failed validation: %v\n", err)
-    } else {
-      exec.Command(nginxCommand, reloadArgs...).Run()
-      fmt.Printf("nginx config updated.\n")
+    if freezeConfig != true {
+      err = exec.Command(nginxCommand, verifyArgs...).Run()
+      if err != nil {
+        fmt.Printf("ERR: nginx config failed validation: %v\n", err)
+        fmt.Printf("Sent config error notification to statsd.\n")
+        nginxArgs := []string{
+          nginxConfDir + "/nginx-error-statsd.sh",
+		  }
+        shellOut("/bin/bash", nginxArgs)
+      } else {
+        exec.Command(nginxCommand, reloadArgs...).Run()
+        fmt.Printf("nginx config updated.\n")
+      }
     }
   }
 }
